@@ -1,0 +1,310 @@
+#version 460 core
+#define MAX_RAY 4
+#define PI 3.1415926535897932384626433832795
+layout(local_size_x = 8, local_size_y = 4) in;
+
+layout(rgba32f, binding = 0) uniform image2D imgOutput;
+
+layout(rgba8, binding = 1) uniform image2D skyboxtex;
+
+uniform mat4 projection;
+uniform mat4 view;
+uniform vec2 u_resolution;
+uniform vec2 sky_resolution;
+uniform int frame;
+
+float fov = 90.0;
+
+// ivec2 pixel;
+
+#define CIRCLE_STRIDE 8
+layout(std430, binding = 0) buffer DataBuffer {
+    float values[];
+};
+
+layout(std430, binding = 1) buffer DataBuffer2 {
+    float light[];
+};
+
+// vec3 point_light = vec3(2, -10, 0);
+// float intensity = 2.5;
+// vec3 light_color = vec3(1,1,1);
+
+// pos, intensity, color
+// float light[] = float[](2, -10, 0, 2.5, 0, 1, 1, -2, -10, 0, 2.5, 1, 1, 0);
+
+vec3 ground = vec3(0, -1, 0);
+vec3 ground_point = vec3(-1, 1.0, -7.0);
+struct Circle {
+    vec3 pos;
+    float radius;
+    vec4 color;
+    float reflectance;
+};
+
+
+// #define MAX_CIRCLES 4
+// Circle circles[MAX_CIRCLES] = Circle[](
+//     Circle(vec3(0,-2,-3), 1.0, vec4(1,0,0,1)),
+//     Circle(vec3(0,-2,-5), 2.0, vec4(1,1,0,1)),
+//     Circle(vec3(0,0,-10), 2.5, vec4(1,1,1,1)),
+//     Circle(vec3(-1, -2.0, -7), 1, vec4(1,1,1,1))
+//     // Circle(vec3(0,50,-7), 50.0, vec4(0.5,0.5,0.0,1.0))
+// );
+
+struct HitInfo {
+    bool hit;
+    vec4 col;
+    vec3 normal;
+    float t;
+    int idx;
+    float reflectiveness;
+};
+
+bool intersectSphere(vec3 ro, vec3 rd, Circle c, out float tHit) {
+    // c.pos = (view * vec4(c.pos, 1.0)).xyz; // Transform circle position to view space
+    vec3 oc = ro - (view * vec4(c.pos, 1.0)).xyz;
+    float a = dot(rd, rd);
+    float b = 2.0 * dot(oc, rd);
+    float cc = dot(oc, oc) - c.radius*c.radius;
+    float disc = b*b - 4.0*a*cc;
+    if(disc < 0.0) return false;
+    float t0 = (-b - sqrt(disc)) / (2.0*a);
+    float t1 = (-b + sqrt(disc)) / (2.0*a);
+    tHit = (t0 > 0.0) ? t0 : ((t1 > 0.0) ? t1 : -1.0);
+    return tHit > 0.0;
+}
+
+vec3 skybox(vec3 rdir){
+    // vec3 dir = vec3(rdir.x + cos(0)*sin(frame*0.01), rdir.y + sin(0)*sin(frame*0.01), rdir.z + cos(frame*0.01));
+    vec3 rd = normalize((inverse(view) * vec4(rdir,0.0)).xyz); // Transform ray direction to view space
+    
+    ivec2 pixel = ivec2(int((atan(rd.z, rd.x) / (2.0 * PI) + 0.5) * sky_resolution.x), int((asin(clamp(rd.y, -1.0, 1.0)) / PI + 0.5) * sky_resolution.y));
+    pixel.y = int(sky_resolution.y) - pixel.y - 1; // Flip Y for image lookup
+    pixel = clamp(pixel, ivec2(0), ivec2(sky_resolution.x, sky_resolution.y) - 1);
+    return clamp(imageLoad(skyboxtex, pixel).xyz, 0.0, 1.0);
+    // return vec3((sky_resolution.x)/1200, (sky_resolution.y), 0.0); // Debug: visualize UV coords
+    // return clamp(imageLoad(skyboxtex, ivec2(1,1)), 0.0, 1.0);
+}
+
+HitInfo getHit(vec3 ro, vec3 rd, bool groundIntersect) {
+    HitInfo h;
+    // h.col = vec4(0.2471, 0.6039, 0.7451, 1.0);
+    h.col = vec4(skybox(rd),1.0);
+    h.t = 1e9;
+    h.idx = -1;
+    h.hit = false;
+    h.reflectiveness = 0.0;
+
+    float t;
+    // if (h.idx == -2){
+    //     return h;
+    // } 
+    for(int i=0; i<values.length()/CIRCLE_STRIDE; i++) {
+        Circle circle = Circle(
+            vec3(values[i*CIRCLE_STRIDE + 0], values[i*CIRCLE_STRIDE + 1], values[i*CIRCLE_STRIDE + 2]),
+            values[i*CIRCLE_STRIDE + 3],
+            vec4(values[i*CIRCLE_STRIDE + 4], values[i*CIRCLE_STRIDE + 5], values[i*CIRCLE_STRIDE + 6], 1.0),
+            values[i*CIRCLE_STRIDE + 7]
+        );
+        if(intersectSphere(ro, rd, circle, t) && t < h.t && t > 0.0) {
+            h.hit = true;
+            h.t = t;
+            h.col = circle.color;
+            h.idx = i;
+            h.reflectiveness = circle.reflectance;
+            vec3 oc = (view * vec4(circle.pos, 1.0)).xyz;
+            vec3 hitpoint = ro + rd * h.t;
+            h.normal = normalize(hitpoint - oc);
+        }
+    }
+
+    for(int i=0; i<light.length()/CIRCLE_STRIDE; i++) {
+        Circle circle = Circle(
+            vec3(light[i*CIRCLE_STRIDE + 0], light[i*CIRCLE_STRIDE + 1], light[i*CIRCLE_STRIDE + 2]),
+            light[i*CIRCLE_STRIDE + 7],
+            vec4(light[i*CIRCLE_STRIDE + 4], light[i*CIRCLE_STRIDE + 5], light[i*CIRCLE_STRIDE + 6], 1.0),
+            light[i*CIRCLE_STRIDE + 3]
+        );
+        if(intersectSphere(ro, rd, circle, t) && t < h.t && t > 0.0) {
+            h.hit = true;
+            h.t = t;
+            h.col = circle.color;
+            h.idx = -2;
+            h.reflectiveness = circle.reflectance;
+            vec3 oc = (view * vec4(circle.pos, 1.0)).xyz;
+            vec3 hitpoint = ro + rd * h.t;
+            h.normal = normalize(hitpoint - oc);
+        }
+    }
+
+
+    if(groundIntersect){
+        h.hit = true;
+        h.reflectiveness = 1.0;
+        float t_ground = dot(ground,ground_point-ro)/ dot(ground, rd);
+        vec3 groundhit = ro + rd * t_ground;
+        if(length(groundhit) < h.t && groundhit.z < 0.0){
+            h.t = length(groundhit);
+            float color = 1- clamp(length(groundhit)/200.0, 0.0, 1.0);
+            h.col = vec4(0.5, 0.5, 0.0,color); // Ground color
+            h.idx = -1; // No circle hit
+            h.normal = ground;
+        }
+    }
+    return h;
+}
+
+uint hash(uint x) {
+    x += (x << 10u);
+    x ^= (x >> 6u);
+    x += (x << 3u);
+    x ^= (x >> 11u);
+    x += (x << 15u);
+    return x;
+}
+
+float rand(vec2 co)
+{
+    return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453);
+}
+
+float random(float f) {
+    uint h = hash(floatBitsToUint(f));
+    return uintBitsToFloat((h & 0x007FFFFFu) | 0x3F800000u) - 1.0;
+}
+
+vec4 diffuse(vec3 ro, vec3 n, int selfidx) {
+    // Build TBN basis aligned to surface normal
+    vec3 up = abs(n.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
+    vec3 tangent   = normalize(cross(up, n));
+    vec3 bitangent = cross(n, tangent);
+
+    float golden_angle = PI * (3.0 - sqrt(5.0)); // correct golden angle in radians
+    int n_points = 5000;
+    int nn = 0;
+    vec4 retcolor = vec4(0,0,0,0);
+    // int idx = frame*200;
+    // for (int i = idx%n_points; i < min((idx%n_points)+200,n_points); i++) {
+    for (int i = 0; i < n_points; i++) {
+        // Generate hemisphere sample in local space
+
+        // for(int j = 0; j<1; j++){
+            // int i = (int(random(uint(frame+j))*n_points ));
+            float cosTheta = float(i) / float(n_points - 1); // 0..1
+            float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+            float phi = golden_angle * float(i);
+
+            // Local hemisphere direction (Z-up)
+            vec3 localDir = vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+
+            // Rotate into world/view space using TBN
+            vec3 rd = normalize(localDir.x * tangent + localDir.y * bitangent + localDir.z * n);
+
+            HitInfo h = getHit(ro, rd, false);
+            if (h.idx == selfidx) continue;
+            nn++;
+            if (h.idx == -2) {
+                retcolor += ((h.col * h.reflectiveness * max(dot(n,rd),0.0) * 5/ abs(h.t)));
+            }else if (h.idx == -1) {
+                retcolor += h.col * (1 - h.reflectiveness) * max(dot(n,rd),0.0);
+            }
+            // break;
+        }
+
+    // }
+
+    retcolor /= float(nn);
+    return retcolor;
+}
+
+vec4 trace_ray(vec3 ro, vec3 rd, int numreflect, ivec2 pixel, ivec2 sampl) {
+    // int numreflections = 2;
+    vec4 final_color = vec4(0,0,0,1);
+    vec3 original_rd = vec3(rd.x, rd.y, rd.z);
+    int num_points = 5000;
+    bool hit_light = false;
+    
+    for(int i = 0; i<numreflect; i++){
+        HitInfo h = getHit(ro, rd, false);
+    
+        vec3 up = abs(h.normal.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
+        vec3 tangent   = normalize(cross(up, h.normal));
+        vec3 bitangent = cross(h.normal, tangent);
+
+        float golden_angle = PI * (3.0 - sqrt(5.0)); // correct golden angle in radians
+
+        if (h.idx == -2) {
+            final_color += h.col * h.reflectiveness / abs(h.t);
+            hit_light = true;
+            final_color /= float(i+1);
+            return final_color;
+            // break;
+        }
+        if (h.idx == -1) {
+            break;
+        }
+
+        // final_color += h.col * (1 - h.reflectiveness) * max(dot(h.normal,rd),0.0);
+        final_color += h.col;
+        // rd = reflect(rd, h.normal);
+        ro = ro + rd * (h.t-0.01); // Move ray origin to hit point for next iteration
+
+
+        // int idx = int(rand(vec2(float(i+frame+pixel.x+pixel.y + ro.x), float(ro.y+ro.z + sampl.x+sampl.y)))*num_points);
+
+        float theta = rand(vec2(float(i+frame+pixel.x+pixel.y + ro.x), float(ro.y+ro.z + sampl.x+sampl.y)))*2*PI;
+        float phi = rand(vec2(float(ro.y+ro.z + sampl.x+sampl.y),float(i+frame+pixel.x+pixel.y + ro.x)))*2*PI;
+
+        float cosTheta = cos(theta); // 0..1
+        float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+        // Local hemisphere direction (Z-up)
+        vec3 localDir = vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+        // Rotate into world/view space using TBN
+        rd = normalize(localDir.x * tangent + localDir.y * bitangent + localDir.z * h.normal);
+        if (dot(h.normal, rd) < 0.0) {
+            rd = -1.0 * rd; // Flip direction if it's below the surface
+        }
+    }
+
+    return vec4(0);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(u_resolution.x) || pixel.y >= int(u_resolution.y)) return;
+
+    int nsamples = 1 ;
+
+    vec4 final_color = vec4(0,0,0,1);
+
+    ground = (view * vec4(ground + ground_point, 1.0)).xyz; // Transform ground normal to view space
+    ground_point = (view * vec4(ground_point, 1.0)).xyz; // Transform ground point to view space
+    ground -= ground_point;
+    
+    ground = normalize(ground); // Normalize the ground normal
+
+    for (int samplx = 0; samplx<nsamples; samplx++){
+        for (int samply = 0; samply<nsamples; samply++){
+
+            vec2 uv = (vec2(pixel.x, pixel.y) + 0.5) / u_resolution * 2.0 - 1.0;
+            // uv.x += samplx/10;
+            uv.y = -uv.y; // flip
+
+            float z = -1.0 / tan(radians(fov) * 0.5);
+            vec3 rd = normalize(vec3(uv, z));
+            vec3 ro = vec3(0,0,0);
+
+
+            // Ray direction in NDC
+            int numreflections = 10;
+
+            final_color += trace_ray(ro,rd,numreflections, pixel, ivec2(samplx*5, samply*5));
+        }
+    }
+
+    final_color /= nsamples*nsamples;
+    // final_color = clamp(imageLoad(skyboxtex, pixel), 0.0, 1.0);
+    imageStore(imgOutput, pixel, final_color);
+    
+}
